@@ -1,0 +1,369 @@
+---
+title: "A visual approach for analysis and inference of molecular activity spaces"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+This pipeline can efficiently be used to build probabilistic surfaces of molecular activity (PSMAs) for visual characterization of molecules in molecular activity spaces. This approach allows building of a non-parametric classification model out of raw similarity data. 
+
+The following libraries are required:
+```{r results='hide', message=FALSE, warning=FALSE}
+library(MASS)
+library(Rtsne)
+library(pROC)
+library(mltools)
+```
+
+
+## Methodology
+The  basic  idea  of  this  approach  is  to  capture  the  measured  molecular  distances according to any proven method and try to represent those molecules in a reduced reference space for analysis and visualization. The procedure to create a PSMA can be divided into the following steps:
+
+   * Full similarity matrix of a molecular data set is computed and transformed  into  distance 
+   * Metric space is projected  into  a 2-Dimensional (2D) space using dimension reduction algorithms (PCooA, Kruskal multidimensional scaling, Sammon mapping and t-SNE)
+   *  Finally, the probabilities of the reduced space are computed using a 2D KDE function within a Bayesian perspective to         produce a probability map of a projected molecule for all classes.
+
+### Data set
+ The selected data sets (Additional File 2: SIGMAR1, HRH1, HERG,and DRD5)  were curated using an automated QSAR modelling workflow (https://doi.org/10.1186/s13321-017-0256-5) and divided into two classes using a cut-off activity value (Ki) to separate highly active molecules (Ki<=10.0) as positives and less active and non-active molecules (Ki >10.0) as negatives. 
+ 
+The test example in this tutorial is a small curated dataset retrieved from ChEMBL for the Human Sigma 1 receptor (Q99720). The dataset consists of molecules from several studies measuring the Ki from the displacement of [3H]-pentazocine.
+About 226 molecules were selected and stored in two separate files, although everything could have been managed with just one. Thus we have a sigma1.smi, containing a SMILES file used for similarity quantification, and a Sigma1_With_Class_labels.csv (Additional File 2), that includes the ChEMBL ids of all molecules, the respective canonical SMILES, the Ki for the assays at hand, and an empirical division in classes.
+
+#### Read curated data 
+```{r}
+dat_full<-read.csv("Sigma1_With_Class_labels.csv")
+#################### For data set without class label:
+#dat_full$Class[dat_full$Vals<=10]<- "P"
+#dat_full$Class[dat_full$Vals>10]<- "N"
+#######################################################
+dat<-dat_full
+head(dat)
+table(dat$Class)
+```
+
+### From similarity to distance
+Molecular pairwise similarity was quantified  using  a  graph  matching  algorithm:  The  Non-contiguous  Atom Matching Structural similarity (NAMS). (See NAMS Tutorials: http://www.di.fc.ul.pt/~afalcao/NAMS-tutorials.html).
+NAMS similarities file for the Sigma 1 (Additional File 2: NAMS_Sigma1_sims.txt)
+Having the SMILES file, we can use the call_makenamsdb and call_nams procedures defined in the NAMS Tutorial to make the similarities files. Please take notice that for sigma1.smi Running NAMS mode 2, of all against all involves 25425 comparisons which can take several minutes, depending on the available CPU speeds.
+
+For easier processing and constructing of the similarities matrix, we well need to decoe the ChEMBL IDs into actual matrix row, col numbers, so we will neeed a sort of a Python dictionary, to map ChEMBLID into the internal IDs   
+
+```{r}
+molids=as.integer(substr(dat$chemblId, 7,200))
+NM<-nrow(dat)
+
+#Read NAMS similarity file,
+sims<-read.table("NAMS_Sigma1_sims.txt", header=T)
+
+Nsims<-nrow(sims)
+D_mols<-1:NM
+names(D_mols)<-molids
+head(D_mols)
+
+#calculate the distance matrix,First compute the similarity matrix and afterwards,
+smat<-matrix(0,NM,NM)
+#check how D_mols is used to convert the chEMBL molids into row and column
+for(i in 1:Nsims) smat[D_mols[as.character(sims$molid1[i])], 
+                       D_mols[as.character(sims$molid2[i])]]<-sims$Sscore[i]
+
+smat<-smat+t(smat)
+#adding the self-similary score of 1.0 in the diagonals concludes the construction of the similarity matrix
+diag(smat)<-1.0
+smat[1:6, 1:6]
+full_smat<-smat
+nrow(full_smat)
+
+```
+
+Distance matrix (training data) 
+
+```{r}
+#split data into train and test
+set.seed(200)
+
+smp<-sample(1:NM, NM*.20)
+dat<-dat_full[-smp,]
+#nrow(dat)
+table(dat$Class)
+
+# training data similarity matrix
+smat<-full_smat[-smp,-smp]
+#nrow(smat)
+
+# Testing/candidate molecules similarity matrix
+csmat<-full_smat[smp, -smp]
+#nrow(csmat)
+#ncol(csmat)
+
+######################################################
+#now this is the distance matrix of training data
+######################################################
+k<-2-(1+sqrt(5))/2;k
+dmat<- 1-(k*smat)/(1+k-smat)
+
+#plot similarity vs distance
+plot(smat, dmat, ylim=c(0,1), xlab="Similarity", ylab="Distance", main="Similarity to distance tranformations")
+
+#Final metric space
+dmat<- as.dist(dmat)
+```
+
+###Projection into a 2D space
+
+```{r results='hide', message=FALSE, warning=FALSE}
+pcooa<-cmdscale(dmat)
+
+mds<-isoMDS(dmat, trace=F)
+
+samon<-sammon(dmat)
+
+tsne <- Rtsne(as.matrix(dmat), dims = 2, perplexity=30, verbose=TRUE, max_iter = 500, is_distance = TRUE)
+
+```
+
+#### Shepard  plots
+Since dimensionality reduction is one of the important task in data visualization where it is really necessary to capture the maximum original data information in the  new  reduced  space,  Shepard  plots    were  generated  to  analyze  how  much molecular initial proximity relationship remained intact. In Shepard plots the original distances are plotted against the projected distances and, ideally, the points(both distances) should lie on a straight line, which would indicate zero distortion in the projection function.
+
+```{r}
+#par(mfrow=c(2,2))
+sh<- Shepard(dmat, pcooa)
+plot(sh, pch = ".", col = "blue", xlab = "Orignal Dissimilarity",  ylab = "Projected Distance(PCooA)", cex.lab= 1.5)
+
+sh<- Shepard(dmat, mds$points)
+plot(sh, pch = ".", col = "blue" ,xlab = "Orignal Dissimilarity",  ylab = "Projected Distance(KMDS)", cex.lab= 1.5)
+
+sh<- Shepard(dmat, samon$points)
+plot(sh, pch = ".", col = "blue",xlab = "Orignal Dissimilarity",  ylab = "Projected Distance(Sammon)", cex.lab= 1.5)
+
+sh<- Shepard(dmat, tsne$Y)
+plot(sh, pch = ".", col = "blue", xlab = "Orignal Dissimilarity",  ylab = "Projected Distance(t-SNE)", cex.lab= 1.5)
+
+```
+
+### Create the probabilistic surface of molecular activity (PSMA)  
+
+Generate the surfaces for each class (P, N)
+
+```{r}
+# X, Y coordinates frm any DR algorithm can be used.
+
+# X coordinates
+X<-pcooa[,1]
+#X<-mds$points[,1]
+#X<-samon$points[,1]
+#X<-tsne$Y[,1]
+
+
+#Y coordinates
+Y<-pcooa[,2]
+#Y<-mds$points[,2]
+#Y<-samon$points[,2]
+#Y<-tsne$Y[,2]
+
+# X, Y coordinates
+XYpoints<-pcooa
+#XYpoints<-mds$points
+#XYpoints<-samon$points
+#XYpoints<-tsne$Y
+
+#bandwidth
+(bws<-c(bandwidth.nrd(X), bandwidth.nrd(Y)))
+(lims<-c(range(X), range(Y))*2)
+
+#kernel density estimation (KDE) is a non-parametric way to estimate the probability 
+#density function (describes the relative likelihood for this random variable to take on a 
+#given value,it is given by the area under the density function but above the horizontal axis 
+img_A<-kde2d(X[dat$Class=="P"], Y[dat$Class=="P"], n=128, lims=lims, h=bws)
+img_B<-kde2d(X[dat$Class=="N"], Y[dat$Class=="N"], n=128, lims=lims, h=bws)
+
+
+
+
+```
+
+
+Now correct the Zs according to the actual priors (the frequencies of each class (P, N))
+
+```{r}
+NMM<-length(dat$Class)
+priors<-table(dat$Class)/NMM
+img_A$z<-img_A$z*priors["P"]
+img_B$z<-img_B$z*priors["N"]
+
+```
+
+
+Here we will show the actual MAP for exceptional quality (class P) and plot all the molecules of each class in separate colors:
+
+   * Class P - Red
+   * Class N - White
+
+```{r}
+AP_A<-img_A
+AP_A$z<-img_A$z / (img_A$z + img_B$z)
+par(mfrow=c(1,1))
+image(AP_A, col = terrain.colors(100), main = "Training data projection over 2D probability map (PCooA)")
+contour(AP_A, add=T)
+points(X[dat$Class=="P"], Y[dat$Class=="P"], pch = 21, bg = "red", col="grey")
+points(X[dat$Class=="N"], Y[dat$Class=="N"], pch = 21, bg = "white", col="grey")
+
+```
+
+#### Test/candidate molecules projection
+
+```{r}
+#Test/candidate molecules similarity matrix
+NCM<- nrow(csmat) 
+CD_mols<-molids[smp]
+csmat[1:6, 1:6]
+
+# Test/candidate molecules distance matrix
+cdmat<- 1-(k*csmat)/(1+k-csmat)
+cdmat[1:6, 1:6]
+
+
+```
+
+Collocate the test molecules within the molecular space defined by the spatial model.
+
+```{r}
+#calculate a data transformation matrix
+matC <-  as.matrix(XYpoints)
+matD <-  as.matrix(dmat)
+matA<- solve(matD) %*% matC
+
+#with the A matrix computed we can now transform the test/candidate distance matrix into the new referenced space
+
+#nrow(cdmat)
+#ncol(cdmat)
+#nrow(matA)
+
+c_proj<- cdmat %*% matA
+
+Xc<-c_proj[,1]
+Yc<-c_proj[,2]
+Xc_DR<-Xc
+Yc_DR<-Yc
+```
+
+Select the molecules that are in higher probability locations for that we may need to define an interpolation function that, for a given image and coordinates is able to retrieve the appropriate surface value With this function it should be quite simple to detect the most promising candidates and attribute them a likelyhood score of being active.
+
+```{r}
+
+get_SurfValue<-function(x, y, img){
+  if(x>max(range(img$x))) return(-1)
+  if(x<min(range(img$x))) return(-1)
+  if(y>max(range(img$y))) return(-1)
+  if(y<min(range(img$y))) return(-1)
+  (col<-which.min(img$x<x))
+  (row<-which.min(img$y<y))
+  return(img$z[col, row])
+}
+
+NCM<-nrow(csmat)
+surf_values<-c()
+for(i in 1:NCM) surf_values<-c(surf_values, get_SurfValue(Xc[i], Yc[i], AP_A))
+
+
+#We can now identify which are the most likely molecules
+
+cands_ords<-order(surf_values, decreasing=T)
+mol_id<-CD_mols[cands_ords]
+dat_full$id<-as.integer(substr(dat_full$chemblId, 7,200))
+
+
+pred<-data.frame(dat_full[smp,], prob=surf_values, CD_mols)
+
+#sort predictions
+head(pred[order(-pred$prob),], n= 6 )
+#write.csv(pred, file = "test_set_predictions.csv", row.names = F)
+
+
+```
+
+Test set projection over 2D probability map
+
+```{r}
+image(AP_A, col = terrain.colors(100), main= "Test set projection over 2D probability map (PCooA)" ) 
+contour(AP_A, add=T)
+
+xx_n<-Xc_DR[pred$Class!="P"]
+yy_n<-Yc_DR[pred$Class!="P"]
+
+xx_p<-Xc_DR[pred$Class=="P"]
+yy_p<-Yc_DR[pred$Class=="P"]
+
+points(xx_n, yy_n, pch = 21, bg = "white", col="grey")
+points(xx_p, yy_p, pch = 21, bg = "red", col="grey")
+
+```
+
+
+#### Probabilistic surface of molecular activity (PSMA)
+
+Convert plot into 3D for visualization.
+
+```{r, fig.width = 15, fig.height = 10  }
+grid_size<-128
+color<-terrain.colors(100)
+zfacet <- AP_A$z[-1, -1] + AP_A$z[-1, -grid_size] + AP_A$z[-grid_size, -1] + AP_A$z[-grid_size, -grid_size]
+facetcol <- cut(zfacet, 100)
+pmat<-persp(AP_A, col = color[facetcol], phi = 45, theta = 330, expand=0.3, nticks = 5,ticktype = "simple",  box = T,
+            zlab = "Probability", xlab = "X")
+
+xx_n<-Xc_DR[pred$Class!="P"]
+yy_n<-Yc_DR[pred$Class!="P"]
+zz_n<-surf_values[pred$Class!="P"]
+
+mypoints_n <- trans3d(xx_n, yy_n, zz_n, pmat=pmat)
+points(mypoints_n, col="white")
+points(mypoints_n, pch=3, col="white")
+
+xx_p<-Xc_DR[pred$Class=="P"]
+yy_p<-Yc_DR[pred$Class=="P"]
+zz_p<-surf_values[pred$Class=="P"]
+
+mypoints_p <- trans3d(xx_p, yy_p, zz_p, pmat=pmat)
+points(mypoints_p, col="red")
+points(mypoints_p, pch=3, col="red")
+
+```
+
+### Assessing and validating PSMA as a classification model
+PSMA performance assessment using the Area Under Curve (AUC) and the Matthews Coefficient Correlation (MCC). 
+
+
+```{r}
+head (pred[order(-pred$prob),]) 
+table(pred$Class)
+truth<-pred$Class
+
+
+###################################
+# Area Under Curve (AUC)
+plot.roc(truth, pred$prob,print.auc=T, 
+         print.thres=T,
+         print.thres.pch=25,
+         print.thres.adj=c(0.5,2),
+         print.thres.col="blue",
+         print.thres.cex=0.8,
+         print.auc.adj=c(0,1),
+         print.auc.col="red",
+         print.auc.cex=1) 
+title("ROC Curve", line = 2.5)
+```
+
+```{r}
+preds<-c("N", "P")[(pred$prob>0.349)+1];
+tt1<-table(truth, preds);tt1
+TP<-tt1[2,2]
+TN<-tt1[1,1]
+FP<-tt1[1,2]
+FN<-tt1[2,1]
+
+# Matthews Coefficient Correlation (MCC)
+MCC<-mcc(TP=TP, FP=FP, TN=TN, FN=FN);MCC
+```
+
